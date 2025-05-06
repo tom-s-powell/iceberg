@@ -1,0 +1,283 @@
+version: 2.1
+
+orbs:
+  secret-injector: palantir-orbs/secret-injector@0.1.0
+
+executors:
+  machine:
+    resource_class: large
+    machine:
+      docker_layer_caching: true
+      image: docker-27
+    environment:
+      JAVA_HOME: /opt/java17
+  docker:
+    docker:
+      - image: 'docker.palantir.build/circle2-build-images/ubuntu-jammy-standard:1.58.0'
+    environment:
+      JAVA_HOME: /opt/java17
+
+commands:
+  publish:
+    parameters:
+      release_type:
+        description: Artifactory repository to publish to
+        type: enum
+        enum: [ 'release', 'snapshot', 'sandbox' ] # (∞, 14d, 7d)
+    steps:
+      - secret-injector/check
+      - run:
+          name: Write version.txt
+          # We use our versioning scheme for tags and snapshots. Iceberg uses the 'version.txt', if present, to
+          # determine the project version (see `getProjectVersion()` in build.gradle). We specify the version because
+          # our scheme differs from Iceberg's, e.g. we need snapshot versions like '1.9.0.0-2-g6da7915' as opposed to
+          # '1.10.0-SNAPSHOT'.
+          #
+          # Note that the `git describe`-based scheme matches the Palantir internally used one.
+          # See: https://github.com/palantir/gradle-git-version
+          #
+          # For snapshots, Artifactory enforces that the version match the regex ".*g[-+.]?[a-fA-F0-9]{3,}". We thus use
+          # the --long flag in `git describe` when publishing a snapshot.
+          command: |
+            case <<parameters.release_type>> in
+              "release")
+                git describe --tags --always --first-parent | sed "s/^apache-iceberg-//" > version.txt
+                ;;
+              *)
+                # Always include the commit hash, even if we're publishing from a commit with a tag
+                git describe  --tags --always --first-parent --long | sed "s/^apache-iceberg-//" > version.txt
+                ;;
+            esac
+      - run:
+          name: Publishing version
+          command: cat version.txt
+      - run:
+          name: Publish
+          # See deploy.gradle
+          #
+          # Note we don't set '-Prelease' and treat all builds (even release builds) as snapshot releases. This is
+          # because release builds are configured to be signed which we don't want to deal with.
+          command: |
+            ./gradlew publish --info \
+              -PmavenUser="$ARTIFACTORY_USERNAME" \
+              -PmavenPassword="$ARTIFACTORY_PASSWORD" \
+              -PmavenSnapshotsRepo=https://artifactory.palantir.build/artifactory/internal-jar-<<parameters.release_type>>
+  save_gradle_cache:
+    description: 'Persist Gradle cache'
+    parameters:
+      suffix:
+        description: Suffix to append to the cache key
+        type: string
+        default: ''
+    steps:
+      - save_cache:
+          key: 'v0-gradle-caches-{{ checksum "gradle/libs.versions.toml" }}-{{ checksum "build.gradle" }}-<< parameters.suffix >>'
+          paths:
+            - ~/.gradle/caches
+      - save_cache:
+          key: 'v0-gradle-wrapper-{{ checksum "gradle/wrapper/gradle-wrapper.properties" }}'
+          paths:
+            - ~/.gradle/wrapper
+  restore_gradle_cache:
+    description: 'Load Gradle cache'
+    parameters:
+      suffix:
+        description: Suffix to append to the cache key
+        type: string
+        default: ''
+    steps:
+      - restore_cache:
+          # Try looking up the cache for the provided suffix. Otherwise fallback to the empty suffix, which we expect
+          # is used by the compile task.
+          keys:
+            - 'v0-gradle-caches-{{ checksum "gradle/libs.versions.toml" }}-{{ checksum "build.gradle" }}-<< parameters.suffix >>'
+            - 'v0-gradle-caches-{{ checksum "gradle/libs.versions.toml" }}-{{ checksum "build.gradle" }}-'
+      - restore_cache:
+          key: 'v0-gradle-wrapper-{{ checksum "gradle/wrapper/gradle-wrapper.properties" }}'
+  store_junit_results:
+    description: "Store JUnit test results"
+    steps:
+      # Iceberg repo specific: See logDir config in build.gradle where they setup 'testlogs' for test logs
+      - run:
+          name: Copy test logs
+          command: cp -r ./build/testlogs ~/artifacts/testlogs
+          when: always
+      - run:
+          name: Find JUnit test reports
+          command: find . -path '**/build/reports/tests' -exec cp --recursive --parents {} ~/artifacts/ \;
+          when: always
+      - store_artifacts:
+          path: ~/artifacts
+      # Scoop up JUnit test results for display in CircleCI
+      - run:
+          name: Find JUnit test results
+          command: find . -path '**/build/test-results/*/TEST-*.xml' -exec cp --parents {} ~/junit/ \;
+          when: always
+      - store_test_results:
+          path: ~/junit
+  prepare_docker_images:
+    description: "Prepare docker images"
+    steps:
+      # We're pull the docker image in advance using Palantir's mirror. This avoids hitting rate limits when
+      # directly pull from Docker Hub in MinioUtil.
+      - run: docker pull hub.docker.palantir.build/minio/minio:latest
+
+jobs:
+
+  compile:
+    executor: docker
+    steps:
+      - checkout
+      - restore_gradle_cache
+      - run:
+          name: Compile
+          command: ./gradlew compileJava compileScala
+      - persist_to_workspace:
+          root: .
+          paths:
+            - .
+      - save_gradle_cache
+
+  # From java-ci.yml
+  core-tests:
+    executor: machine
+    steps:
+      - attach_workspace:
+          at: .
+      - restore_gradle_cache: { suffix: core }
+      - prepare_docker_images
+      - run:
+          command: ./gradlew check -DsparkVersions= -DflinkVersions= -DkafkaVersions= -Pquick=true -x javadoc
+          no_output_timeout: 30m
+      - store_junit_results
+      - save_gradle_cache: { suffix: core }
+
+  # From java-ci.yml
+  build-checks:
+    executor: docker
+    steps:
+      - attach_workspace:
+          at: .
+      - restore_gradle_cache: { suffix: checks }
+      - run:
+          name: Run checks
+          command: ./gradlew -DallModules build -x test -x javadoc -x integrationTest
+      - save_gradle_cache: { suffix: checks }
+
+  # From spark-ci.yml
+  spark-tests:
+    executor: machine
+    steps:
+      - attach_workspace:
+          at: .
+      - restore_gradle_cache: { suffix: spark }
+      - run:
+          command: |
+            ./gradlew -DallModules -DsparkVersions=3.5 -DscalaVersion=2.12 -DflinkVersions= -DkafkaVersions= \
+              :iceberg-spark:iceberg-spark-3.5_2.12:check \
+              :iceberg-spark:iceberg-spark-extensions-3.5_2.12:check \
+              :iceberg-spark:iceberg-spark-runtime-3.5_2.12:check \
+              -Pquick=true -x javadoc
+          no_output_timeout: 30m
+      - store_junit_results
+      - save_gradle_cache: { suffix: spark }
+
+  publish-sandbox:
+    executor: docker
+    steps:
+      - attach_workspace:
+          at: .
+      - restore_gradle_cache
+      - publish:
+          release_type: sandbox
+
+  publish-snapshot:
+    executor: docker
+    steps:
+      - attach_workspace:
+          at: .
+      - restore_gradle_cache
+      - publish:
+          release_type: snapshot
+
+
+  publish-release:
+    executor: docker
+    steps:
+      - attach_workspace:
+          at: .
+      - restore_gradle_cache
+      - publish:
+          release_type: release
+
+  circle-all:
+    docker: [{ image: 'hub.docker.palantir.build/busybox:1.36.1@sha256:6d9ac9237a84afe1516540f40a0fafdc86859b2141954b4d643af7066d598b74' }]
+    resource_class: small
+    steps:
+      - run: {command: echo "All required jobs finished successfully"}
+
+
+workflows:
+  build-publish:
+    jobs:
+      - compile:
+          filters:
+            tags:
+              only: /.*/
+
+      - core-tests:
+          requires:
+            - compile
+          filters:
+            tags:
+              only: /.*/
+
+      - build-checks:
+          requires:
+            - compile
+          filters:
+            tags:
+              only: /.*/
+
+      - spark-tests:
+          requires:
+            - compile
+          filters:
+            tags:
+              only: /.*/
+
+      # Catch-all for all required checks
+      # Branch protectin requires that this pass
+      - circle-all:
+          requires:
+            - core-tests
+            - build-checks
+            - spark-tests
+          filters:
+            tags:
+              only: /.*/
+
+      - publish-sandbox:
+          requires:
+            - compile
+          filters:
+            branches:
+              ignore: /release\/.*/
+
+      - publish-snapshot:
+          requires: [ circle-all ]
+          filters:
+            tags:
+              ignore: /.*/
+            branches:
+              only: /release\/.*/
+
+      - publish-release:
+          requires: [ circle-all ]
+          filters:
+            tags:
+              # Our version tags look like "1.9.0.1" where "1.9.0" is the Iceberg
+              # version and the ".1" suffix is ours.
+              only: /^\d+\.\d+\.\d+\.\d+$/
+            branches:
+              ignore: /.*/

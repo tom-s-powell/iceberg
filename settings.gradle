@@ -17,6 +17,21 @@
  * under the License.
  */
 
+// Palantir: Apply custom plugins
+buildscript {
+  repositories {
+    maven {
+      url 'https://artifactory.palantir.build/artifactory/release-jar'
+    }
+  }
+  dependencies {
+    classpath 'com.palantir.gradle.buildscan:gradle-internal-build-scan:1.49.0'
+  }
+}
+
+// Palantir: Enable Gradle build scans for profiling
+apply plugin: 'com.palantir.build-scan.settings'
+
 rootProject.name = 'iceberg'
 include 'bom'
 include 'api'

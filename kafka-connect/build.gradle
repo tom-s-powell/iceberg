@@ -17,6 +17,14 @@
  * under the License.
  */
 
+// Palantir: Don't publish the empty parent project because its artifact ID 'iceberg-kafka-connect'
+// conflicts with the subproject whose artifact ID is also 'iceberg-kafka-connect'.
+tasks.withType(PublishToMavenRepository).configureEach { task ->
+  if (project.path == ':iceberg-kafka-connect') {
+    task.enabled = false
+  }
+}
+
 project(':iceberg-kafka-connect:iceberg-kafka-connect-events') {
   dependencies {
     api project(':iceberg-api')

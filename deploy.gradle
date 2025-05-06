@@ -94,7 +94,10 @@ subprojects {
             }
           }
 
-          groupId = 'org.apache.iceberg'
+          // Palantir: We rename the group and artifact ID to distinguish artifacts and coordinates from upstream's
+          groupId = 'com.palantir.iceberg'
+          artifactId = "palantir-$artifactId"
+
           pom {
             name = 'Apache Iceberg'
             description = 'A table format for huge analytic datasets'
