@@ -276,8 +276,9 @@ workflows:
           requires: [ circle-all ]
           filters:
             tags:
-              # Our version tags look like "1.9.0.1" where "1.9.0" is the Iceberg
-              # version and the ".1" suffix is ours.
-              only: /^\d+\.\d+\.\d+\.\d+$/
+              # Our release version tags look like "1.9.0.1" where "1.9.0" is the
+              # Iceberg version and the ".1" suffix is ours. Our RC tags look like
+              # "1.9.0.1-rc1", where the ".1-rc1" suffix is ours.
+              only: /^\d+\.\d+\.\d+\.\d+(-rc\d+)?$/
             branches:
               ignore: /.*/
