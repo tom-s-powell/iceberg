@@ -41,6 +41,7 @@ import software.amazon.awssdk.regions.Region;
 import software.amazon.awssdk.regions.providers.DefaultAwsRegionProviderChain;
 import software.amazon.awssdk.services.dynamodb.DynamoDbClientBuilder;
 import software.amazon.awssdk.services.glue.GlueClientBuilder;
+import software.amazon.awssdk.services.kms.KmsClientBuilder;
 
 public class AwsProperties implements Serializable {
 
@@ -206,6 +207,14 @@ public class AwsProperties implements Serializable {
    */
   public static final String REST_SESSION_TOKEN = "rest.session-token";
 
+  /**
+   * Configure an alternative endpoint of the KMS service for AwsKeyManagementClient to access.
+   *
+   * <p>This could be used to use KMS key management with any KMS-compatible service that has a
+   * different endpoint
+   */
+  public static final String KMS_ENDPOINT = "kms.endpoint";
+
   private final Set<software.amazon.awssdk.services.sts.model.Tag> stsClientAssumeRoleTags;
 
   private final String clientAssumeRoleArn;
@@ -230,6 +239,7 @@ public class AwsProperties implements Serializable {
   private String restAccessKeyId;
   private String restSecretAccessKey;
   private String restSessionToken;
+  private final String kmsEndpoint;
 
   public AwsProperties() {
     this.stsClientAssumeRoleTags = Sets.newHashSet();
@@ -252,6 +262,8 @@ public class AwsProperties implements Serializable {
     this.dynamoDbTableName = DYNAMODB_TABLE_NAME_DEFAULT;
 
     this.restSigningName = REST_SIGNING_NAME_DEFAULT;
+
+    this.kmsEndpoint = null;
   }
 
   @SuppressWarnings("MethodLength")
@@ -293,6 +305,8 @@ public class AwsProperties implements Serializable {
     this.restAccessKeyId = properties.get(REST_ACCESS_KEY_ID);
     this.restSecretAccessKey = properties.get(REST_SECRET_ACCESS_KEY);
     this.restSessionToken = properties.get(REST_SESSION_TOKEN);
+
+    this.kmsEndpoint = properties.get(KMS_ENDPOINT);
   }
 
   public Set<software.amazon.awssdk.services.sts.model.Tag> stsClientAssumeRoleTags() {
@@ -385,6 +399,19 @@ public class AwsProperties implements Serializable {
     configureEndpoint(builder, dynamoDbEndpoint);
   }
 
+  /**
+   * Override the endpoint for a KMS client.
+   *
+   * <p>Sample usage:
+   *
+   * <pre>
+   *     KmsClient.builder().applyMutation(awsProperties::applyKmsEndpointConfigurations)
+   * </pre>
+   */
+  public <T extends KmsClientBuilder> void applyKmsEndpointConfigurations(T builder) {
+    configureEndpoint(builder, kmsEndpoint);
+  }
+
   public Region restSigningRegion() {
     if (restSigningRegion == null) {
       this.restSigningRegion = DefaultAwsRegionProviderChain.builder().build().getRegion().id();
@@ -400,6 +427,10 @@ public class AwsProperties implements Serializable {
   public AwsCredentialsProvider restCredentialsProvider() {
     return credentialsProvider(
         this.restAccessKeyId, this.restSecretAccessKey, this.restSessionToken);
+  }
+
+  public String kmsEndpoint() {
+    return this.kmsEndpoint;
   }
 
   private Set<software.amazon.awssdk.services.sts.model.Tag> toStsTags(
