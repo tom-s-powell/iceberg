@@ -1428,10 +1428,10 @@ public class TableMetadata implements Serializable {
       Set<Long> idsToRemoveSet =
           idsToRemove instanceof Set ? (Set<Long>) idsToRemove : Sets.newHashSet(idsToRemove);
       List<Snapshot> retainedSnapshots =
-          Lists.newArrayListWithExpectedSize(snapshots.size() - idsToRemove.size());
+          Lists.newArrayListWithExpectedSize(snapshots.size() - idsToRemoveSet.size());
       for (Snapshot snapshot : snapshots) {
         long snapshotId = snapshot.snapshotId();
-        if (idsToRemove.contains(snapshotId)) {
+        if (idsToRemoveSet.contains(snapshotId)) {
           snapshotsById.remove(snapshotId);
           if (!suppress) {
             changes.add(new MetadataUpdate.RemoveSnapshots(snapshotId));
