@@ -1424,6 +1424,9 @@ public class TableMetadata implements Serializable {
      * @return this for method chaining
      */
     private Builder rewriteSnapshotsInternal(Collection<Long> idsToRemove, boolean suppress) {
+      // Convert to Set if not already, to ensure more efficient lookups
+      Set<Long> idsToRemoveSet =
+          idsToRemove instanceof Set ? (Set<Long>) idsToRemove : Sets.newHashSet(idsToRemove);
       List<Snapshot> retainedSnapshots =
           Lists.newArrayListWithExpectedSize(snapshots.size() - idsToRemove.size());
       for (Snapshot snapshot : snapshots) {
