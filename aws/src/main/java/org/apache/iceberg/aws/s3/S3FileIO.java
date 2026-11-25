@@ -45,6 +45,7 @@ import org.apache.iceberg.io.DelegateFileIO;
 import org.apache.iceberg.io.FileInfo;
 import org.apache.iceberg.io.InputFile;
 import org.apache.iceberg.io.OutputFile;
+import org.apache.iceberg.io.PrefixListingPage;
 import org.apache.iceberg.io.StorageCredential;
 import org.apache.iceberg.io.SupportsRecoveryOperations;
 import org.apache.iceberg.io.SupportsStorageCredentials;
@@ -77,10 +78,12 @@ import software.amazon.awssdk.services.s3.model.DeleteObjectsResponse;
 import software.amazon.awssdk.services.s3.model.GetObjectTaggingRequest;
 import software.amazon.awssdk.services.s3.model.GetObjectTaggingResponse;
 import software.amazon.awssdk.services.s3.model.ListObjectsV2Request;
+import software.amazon.awssdk.services.s3.model.ListObjectsV2Response;
 import software.amazon.awssdk.services.s3.model.ObjectIdentifier;
 import software.amazon.awssdk.services.s3.model.ObjectVersion;
 import software.amazon.awssdk.services.s3.model.PutObjectTaggingRequest;
 import software.amazon.awssdk.services.s3.model.S3Exception;
+import software.amazon.awssdk.services.s3.model.S3Object;
 import software.amazon.awssdk.services.s3.model.Tag;
 import software.amazon.awssdk.services.s3.model.Tagging;
 import software.amazon.awssdk.services.s3.paginators.ListObjectVersionsIterable;
@@ -351,6 +354,56 @@ public class S3FileIO
                         o.size(),
                         o.lastModified().toEpochMilli()))
             .iterator();
+  }
+
+  @Override
+  public Iterable<PrefixListingPage> listDirectory(String prefix) {
+    Preconditions.checkArgument(
+        prefix != null && prefix.endsWith("/"), "Directory prefix must end with '/': %s", prefix);
+    Preconditions.checkArgument(
+        !prefix.contains("?") && !prefix.contains("#"),
+        "Directory prefix must not contain a query or fragment: %s",
+        prefix);
+    PrefixedS3Client client = clientForStoragePath(prefix);
+    S3URI uri = new S3URI(prefix, client.s3FileIOProperties().bucketToAccessPointMapping());
+    ListObjectsV2Request request =
+        ListObjectsV2Request.builder()
+            .bucket(uri.bucket())
+            .prefix(uri.key())
+            .delimiter("/")
+            .build();
+
+    return () ->
+        client.s3().listObjectsV2Paginator(request).stream()
+            .map(response -> createPrefixListingPage(prefix, uri.key(), response))
+            .iterator();
+  }
+
+  @Override
+  public boolean supportsDirectoryListing(String prefix) {
+    return prefix != null && prefix.endsWith("/") && !prefix.contains("?") && !prefix.contains("#");
+  }
+
+  private PrefixListingPage createPrefixListingPage(
+      String prefix, String keyPrefix, ListObjectsV2Response response) {
+    List<FileInfo> files = Lists.newArrayList();
+    List<String> subPrefixes = Lists.newArrayList();
+    for (S3Object object : response.contents()) {
+      if (!object.key().equals(keyPrefix)) {
+        files.add(
+            new FileInfo(
+                prefix + object.key().substring(keyPrefix.length()),
+                object.size(),
+                object.lastModified().toEpochMilli()));
+      }
+    }
+
+    response
+        .commonPrefixes()
+        .forEach(
+            commonPrefix ->
+                subPrefixes.add(prefix + commonPrefix.prefix().substring(keyPrefix.length())));
+    return PrefixListingPage.of(files, subPrefixes);
   }
 
   /**

@@ -22,6 +22,7 @@ import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.mockito.AdditionalAnswers.delegatesTo;
 import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.Mockito.doAnswer;
 import static org.mockito.Mockito.doReturn;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
@@ -69,6 +70,7 @@ import org.apache.iceberg.io.FileInfo;
 import org.apache.iceberg.io.IOUtil;
 import org.apache.iceberg.io.InputFile;
 import org.apache.iceberg.io.OutputFile;
+import org.apache.iceberg.io.PrefixListingPage;
 import org.apache.iceberg.io.ResolvingFileIO;
 import org.apache.iceberg.io.StorageCredential;
 import org.apache.iceberg.jdbc.JdbcCatalog;
@@ -289,6 +291,49 @@ public class TestS3FileIO {
 
     long totalFiles = scaleSizes.stream().mapToLong(Integer::longValue).sum();
     assertThat(Streams.stream(s3FileIO.listPrefix(prefix)).count()).isEqualTo(totalFiles);
+  }
+
+  @Test
+  void listDirectoryReturnsFilesAndSubPrefixes() {
+    createObjects(
+        "directory/",
+        "directory/data1.dat",
+        "directory/a/data2.dat",
+        "directory/a/b/data3.dat",
+        "directory/c/data4.dat",
+        "directory_sibling/data5.dat");
+
+    List<PrefixListingPage> pages =
+        Lists.newArrayList(s3FileIO.listDirectory("s3://bucket/directory/"));
+
+    assertThat(pages).hasSize(1);
+    assertThat(pages.get(0).files())
+        .extracting(FileInfo::location)
+        .containsExactly("s3://bucket/directory/data1.dat");
+    assertThat(pages.get(0).subPrefixes())
+        .containsExactly("s3://bucket/directory/a/", "s3://bucket/directory/c/");
+  }
+
+  @Test
+  void listDirectoryReturnsPagePerListResponse() {
+    createObjects("paged/data1.dat", "paged/a/data2.dat", "paged/c/data3.dat");
+    doAnswer(
+            invocation ->
+                new ListObjectsV2Iterable(
+                    s3mock,
+                    invocation.<ListObjectsV2Request>getArgument(0).toBuilder().maxKeys(1).build()))
+        .when(s3mock)
+        .listObjectsV2Paginator(any(ListObjectsV2Request.class));
+
+    List<PrefixListingPage> pages =
+        Lists.newArrayList(s3FileIO.listDirectory("s3://bucket/paged/"));
+
+    assertThat(pages).hasSize(3);
+    assertThat(pages.stream().flatMap(page -> Streams.stream(page.files())))
+        .extracting(FileInfo::location)
+        .containsExactly("s3://bucket/paged/data1.dat");
+    assertThat(pages.stream().flatMap(page -> Streams.stream(page.subPrefixes())))
+        .containsExactly("s3://bucket/paged/a/", "s3://bucket/paged/c/");
   }
 
   /**
@@ -973,6 +1018,14 @@ public class TestS3FileIO {
                 s3mock.putObject(
                     builder -> builder.bucket(s3URI.bucket()).key(s3URI.key() + i).build(),
                     RequestBody.empty()));
+  }
+
+  private void createObjects(String... keys) {
+    for (String key : keys) {
+      s3mock.putObject(
+          builder -> builder.bucket(S3_GENERAL_PURPOSE_BUCKET).key(key).build(),
+          RequestBody.empty());
+    }
   }
 
   private void createBucket(String bucketName) {
