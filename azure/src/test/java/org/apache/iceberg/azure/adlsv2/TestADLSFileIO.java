@@ -20,23 +20,38 @@ package org.apache.iceberg.azure.adlsv2;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
+import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.argThat;
+import static org.mockito.ArgumentMatchers.isNull;
 import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.verifyNoInteractions;
 import static org.mockito.Mockito.when;
 
+import com.azure.core.http.rest.PagedIterable;
+import com.azure.core.http.rest.PagedResponse;
+import com.azure.core.http.rest.PagedResponseBase;
 import com.azure.storage.file.datalake.DataLakeFileClient;
 import com.azure.storage.file.datalake.DataLakeFileSystemClient;
+import com.azure.storage.file.datalake.models.DataLakeStorageException;
+import com.azure.storage.file.datalake.models.PathItem;
 import java.io.IOException;
+import java.time.OffsetDateTime;
+import java.util.Iterator;
 import java.util.List;
 import java.util.concurrent.atomic.AtomicInteger;
 import org.apache.iceberg.TestHelpers;
 import org.apache.iceberg.io.BulkDeletionFailureException;
 import org.apache.iceberg.io.FileIO;
+import org.apache.iceberg.io.FileInfo;
 import org.apache.iceberg.io.InputFile;
+import org.apache.iceberg.io.PrefixListingPage;
 import org.apache.iceberg.relocated.com.google.common.collect.ImmutableMap;
 import org.apache.iceberg.util.SerializableFunction;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.MethodSource;
+import org.junit.jupiter.params.provider.NullAndEmptySource;
+import org.junit.jupiter.params.provider.ValueSource;
 
 public class TestADLSFileIO {
 
@@ -319,5 +334,160 @@ public class TestADLSFileIO {
                         "abfs://container@account.dfs.core.windows.net/path/to/deleted")))
         .isInstanceOf(BulkDeletionFailureException.class)
         .hasMessage("Failed to delete 1 files");
+  }
+
+  @Test
+  void listDirectoryReadsPagesLazily() {
+    String prefix = "abfs://container@account.dfs.core.windows.net/dir/";
+    OffsetDateTime createdAt = OffsetDateTime.now();
+    AtomicInteger pagesRead = new AtomicInteger();
+    PagedIterable<PathItem> response =
+        new PagedIterable<>(
+            () -> {
+              pagesRead.incrementAndGet();
+              return page(List.of(pathItem("dir/file", false, createdAt)), "next");
+            },
+            token -> {
+              pagesRead.incrementAndGet();
+              assertThat(token).isEqualTo("next");
+              return page(List.of(pathItem("dir/sub", true, createdAt)), null);
+            });
+    DataLakeFileSystemClient client = mock(DataLakeFileSystemClient.class);
+    when(client.listPaths(any(), any())).thenReturn(response);
+    ADLSFileIO fileIO = new ADLSFileIO(location -> client);
+
+    Iterable<PrefixListingPage> listing = fileIO.listDirectory(prefix);
+    assertThat(pagesRead).hasValue(0);
+
+    Iterator<PrefixListingPage> pages = listing.iterator();
+    PrefixListingPage firstPage = pages.next();
+    assertThat(pagesRead).hasValue(1);
+    assertThat(firstPage.files())
+        .singleElement()
+        .satisfies(
+            file -> {
+              assertThat(file.location()).isEqualTo(prefix + "file");
+              assertThat(file.size()).isEqualTo(123L);
+              assertThat(file.createdAtMillis()).isEqualTo(createdAt.toInstant().toEpochMilli());
+            });
+    assertThat(firstPage.subPrefixes()).isEmpty();
+
+    PrefixListingPage secondPage = pages.next();
+    assertThat(pagesRead).hasValue(2);
+    assertThat(secondPage.files()).isEmpty();
+    assertThat(secondPage.subPrefixes()).containsExactly(prefix + "sub/");
+    assertThat(pages.hasNext()).isFalse();
+  }
+
+  @ParameterizedTest
+  @ValueSource(
+      strings = {
+        "abfs://container@account.dfs.core.windows.net/",
+        "abfss://container@account.dfs.core.windows.net/",
+        "abfs://account.dfs.core.windows.net/",
+        "wasbs://container@account.blob.core.windows.net/"
+      })
+  void listDirectoryReturnsReusableLocations(String prefix) {
+    OffsetDateTime createdAt = OffsetDateTime.now();
+    DataLakeFileSystemClient client = mock(DataLakeFileSystemClient.class);
+    when(client.listPaths(
+            argThat(
+                options ->
+                    options != null && options.getPath().isEmpty() && !options.isRecursive()),
+            isNull()))
+        .thenReturn(
+            new PagedIterable<>(
+                () ->
+                    page(
+                        List.of(
+                            pathItem("file", false, createdAt), pathItem("sub", true, createdAt)),
+                        null)));
+    when(client.listPaths(
+            argThat(
+                options ->
+                    options != null && "sub/".equals(options.getPath()) && !options.isRecursive()),
+            isNull()))
+        .thenReturn(
+            new PagedIterable<>(() -> page(List.of(pathItem("sub/file", false, createdAt)), null)));
+    ADLSFileIO fileIO = new ADLSFileIO(location -> client);
+
+    assertThat(fileIO.supportsDirectoryListing(prefix)).isTrue();
+    PrefixListingPage listing = fileIO.listDirectory(prefix).iterator().next();
+    assertThat(listing.files()).extracting(FileInfo::location).containsExactly(prefix + "file");
+    assertThat(listing.subPrefixes()).containsExactly(prefix + "sub/");
+
+    String subPrefix = listing.subPrefixes().iterator().next();
+    assertThat(fileIO.supportsDirectoryListing(subPrefix)).isTrue();
+    PrefixListingPage childListing = fileIO.listDirectory(subPrefix).iterator().next();
+    assertThat(childListing.files())
+        .extracting(FileInfo::location)
+        .containsExactly(subPrefix + "file");
+    assertThat(childListing.subPrefixes()).isEmpty();
+  }
+
+  @Test
+  void listDirectoryReturnsEmptyForMissingDirectory() {
+    DataLakeStorageException missingDirectory = mock(DataLakeStorageException.class);
+    when(missingDirectory.getStatusCode()).thenReturn(404);
+    DataLakeFileSystemClient client = mock(DataLakeFileSystemClient.class);
+    when(client.listPaths(any(), any()))
+        .thenReturn(
+            new PagedIterable<>(
+                () -> {
+                  throw missingDirectory;
+                }));
+    ADLSFileIO fileIO = new ADLSFileIO(location -> client);
+
+    assertThat(fileIO.listDirectory("abfs://container@account.dfs.core.windows.net/missing/"))
+        .isEmpty();
+  }
+
+  @Test
+  void listDirectoryPropagatesFailures() {
+    DataLakeStorageException forbidden = mock(DataLakeStorageException.class);
+    when(forbidden.getStatusCode()).thenReturn(403);
+    DataLakeFileSystemClient client = mock(DataLakeFileSystemClient.class);
+    when(client.listPaths(any(), any()))
+        .thenReturn(
+            new PagedIterable<>(
+                () -> {
+                  throw forbidden;
+                }));
+    ADLSFileIO fileIO = new ADLSFileIO(location -> client);
+
+    assertThatThrownBy(
+            () ->
+                fileIO
+                    .listDirectory("abfs://container@account.dfs.core.windows.net/dir/")
+                    .iterator()
+                    .hasNext())
+        .isSameAs(forbidden);
+  }
+
+  @ParameterizedTest
+  @NullAndEmptySource
+  @ValueSource(
+      strings = {
+        "abfs://container@account.dfs.core.windows.net",
+        "abfs://container@account.dfs.core.windows.net/dir"
+      })
+  void listDirectoryRejectsInvalidPrefix(String prefix) {
+    DataLakeFileSystemClient client = mock(DataLakeFileSystemClient.class);
+    ADLSFileIO fileIO = new ADLSFileIO(location -> client);
+
+    assertThat(fileIO.supportsDirectoryListing(prefix)).isFalse();
+    assertThatThrownBy(() -> fileIO.listDirectory(prefix))
+        .isInstanceOf(IllegalArgumentException.class)
+        .hasMessageContaining("prefix");
+    verifyNoInteractions(client);
+  }
+
+  private static PagedResponse<PathItem> page(List<PathItem> paths, String continuationToken) {
+    return new PagedResponseBase<>(null, 200, null, paths, continuationToken, null);
+  }
+
+  private static PathItem pathItem(String path, boolean directory, OffsetDateTime createdAt) {
+    return new PathItem(
+        "tag", createdAt, 123L, "group", directory, path, "owner", "permissions", createdAt, null);
   }
 }

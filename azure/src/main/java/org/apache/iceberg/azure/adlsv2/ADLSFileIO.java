@@ -25,7 +25,9 @@ import com.azure.storage.file.datalake.DataLakeFileSystemClient;
 import com.azure.storage.file.datalake.DataLakeFileSystemClientBuilder;
 import com.azure.storage.file.datalake.models.DataLakeStorageException;
 import com.azure.storage.file.datalake.models.ListPathsOptions;
+import com.azure.storage.file.datalake.models.PathItem;
 import java.util.Collections;
+import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.concurrent.atomic.AtomicInteger;
@@ -36,8 +38,11 @@ import org.apache.iceberg.io.DelegateFileIO;
 import org.apache.iceberg.io.FileInfo;
 import org.apache.iceberg.io.InputFile;
 import org.apache.iceberg.io.OutputFile;
+import org.apache.iceberg.io.PrefixListingPage;
 import org.apache.iceberg.metrics.MetricsContext;
 import org.apache.iceberg.relocated.com.google.common.annotations.VisibleForTesting;
+import org.apache.iceberg.relocated.com.google.common.base.Preconditions;
+import org.apache.iceberg.relocated.com.google.common.collect.Lists;
 import org.apache.iceberg.relocated.com.google.common.collect.Maps;
 import org.apache.iceberg.util.SerializableFunction;
 import org.apache.iceberg.util.SerializableMap;
@@ -240,6 +245,57 @@ public class ADLSFileIO implements DelegateFileIO {
         return Collections.emptyIterator();
       }
     };
+  }
+
+  @Override
+  public Iterable<PrefixListingPage> listDirectory(String prefix) {
+    Preconditions.checkArgument(
+        prefix != null && prefix.endsWith("/"), "Directory prefix must end with '/': %s", prefix);
+    ADLSLocation location = new ADLSLocation(prefix);
+
+    ListPathsOptions options = new ListPathsOptions();
+    options.setPath(location.path());
+    options.setRecursive(false);
+
+    return () -> {
+      try {
+        return client(location)
+            .listPaths(options, null)
+            .streamByPage()
+            .map(response -> createPrefixListingPage(location, response.getElements()))
+            .iterator();
+      } catch (DataLakeStorageException e) {
+        if (e.getStatusCode() != 404) {
+          throw e;
+        }
+
+        return Collections.emptyIterator();
+      }
+    };
+  }
+
+  @Override
+  public boolean supportsDirectoryListing(String prefix) {
+    return prefix != null && prefix.endsWith("/");
+  }
+
+  private static PrefixListingPage createPrefixListingPage(
+      ADLSLocation location, Iterable<PathItem> pathItems) {
+    List<FileInfo> files = Lists.newArrayList();
+    List<String> subPrefixes = Lists.newArrayList();
+    for (PathItem pathItem : pathItems) {
+      if (pathItem.isDirectory()) {
+        subPrefixes.add(fullyQualifiedLocation(location, pathItem.getName()) + "/");
+      } else {
+        files.add(
+            new FileInfo(
+                fullyQualifiedLocation(location, pathItem.getName()),
+                pathItem.getContentLength(),
+                pathItem.getCreationTime().toInstant().toEpochMilli()));
+      }
+    }
+
+    return PrefixListingPage.of(files, subPrefixes);
   }
 
   @Override
