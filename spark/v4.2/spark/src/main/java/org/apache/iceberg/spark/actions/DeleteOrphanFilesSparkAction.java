@@ -471,18 +471,6 @@ public class DeleteOrphanFilesSparkAction extends BaseSparkAction<DeleteOrphanFi
             subDirs::add,
             matchingFiles::add);
       }
-
-      JavaRDD<String> matchingFileRDD = sparkContext().parallelize(matchingFiles, 1);
-      if (subDirs.isEmpty()) {
-        return spark().createDataset(matchingFileRDD.rdd(), Encoders.STRING());
-      }
-
-      int parallelism = Math.min(subDirs.size(), listingParallelism);
-      JavaRDD<String> prefixRDD = sparkContext().parallelize(subDirs, parallelism);
-      JavaRDD<String> matchingLeafFileRDD =
-          prefixRDD.mapPartitions(new ListPrefixes(broadcastTable(table), olderThanTimestamp));
-      return spark()
-          .createDataset(matchingFileRDD.union(matchingLeafFileRDD).rdd(), Encoders.STRING());
     } else {
       Predicate<FileStatus> predicate = file -> file.getModificationTime() < olderThanTimestamp;
       // list at most MAX_DRIVER_LISTING_DEPTH levels and only dirs that have
@@ -496,24 +484,28 @@ public class DeleteOrphanFilesSparkAction extends BaseSparkAction<DeleteOrphanFi
           MAX_DRIVER_LISTING_DIRECT_SUB_DIRS,
           subDirs::add,
           matchingFiles::add);
-
-      JavaRDD<String> matchingFileRDD = sparkContext().parallelize(matchingFiles, 1);
-
-      if (subDirs.isEmpty()) {
-        return spark().createDataset(matchingFileRDD.rdd(), Encoders.STRING());
-      }
-
-      int parallelism = Math.min(subDirs.size(), listingParallelism);
-      JavaRDD<String> subDirRDD = sparkContext().parallelize(subDirs, parallelism);
-
-      Broadcast<SerializableConfiguration> conf = sparkContext().broadcast(hadoopConf);
-      ListDirsRecursively listDirs =
-          new ListDirsRecursively(conf, olderThanTimestamp, table.specs());
-      JavaRDD<String> matchingLeafFileRDD = subDirRDD.mapPartitions(listDirs);
-
-      JavaRDD<String> completeMatchingFileRDD = matchingFileRDD.union(matchingLeafFileRDD);
-      return spark().createDataset(completeMatchingFileRDD.rdd(), Encoders.STRING());
     }
+
+    JavaRDD<String> matchingFileRDD = sparkContext().parallelize(matchingFiles, 1);
+
+    if (subDirs.isEmpty()) {
+      return spark().createDataset(matchingFileRDD.rdd(), Encoders.STRING());
+    }
+
+    int parallelism = Math.min(subDirs.size(), listingParallelism);
+    JavaRDD<String> subDirRDD = sparkContext().parallelize(subDirs, parallelism);
+
+    FlatMapFunction<Iterator<String>, String> listDirs;
+    if (usePrefixListing) {
+      listDirs = new ListPrefixes(broadcastTable(table), olderThanTimestamp);
+    } else {
+      Broadcast<SerializableConfiguration> conf = sparkContext().broadcast(hadoopConf);
+      listDirs = new ListDirsRecursively(conf, olderThanTimestamp, table.specs());
+    }
+
+    JavaRDD<String> matchingLeafFileRDD = subDirRDD.mapPartitions(listDirs);
+    JavaRDD<String> completeMatchingFileRDD = matchingFileRDD.union(matchingLeafFileRDD);
+    return spark().createDataset(completeMatchingFileRDD.rdd(), Encoders.STRING());
   }
 
   private static Map<String, String> flattenMap(Map<String, String> map) {

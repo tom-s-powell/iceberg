@@ -24,6 +24,7 @@ import static org.apache.iceberg.types.Types.NestedField.optional;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.assertj.core.api.Assumptions.assumeThat;
+import static org.mockito.AdditionalAnswers.delegatesTo;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyInt;
 import static org.mockito.ArgumentMatchers.anyMap;
@@ -1236,35 +1237,31 @@ public abstract class TestRemoveOrphanFilesAction extends TestBase {
   }
 
   @TestTemplate
-  void prefixListingDefaultsToDriverListing() {
+  void prefixListingDefaultsToDriverListing() throws IOException {
     assumeThat(usePrefixListing).isTrue();
     Table table = TABLES.create(SCHEMA, PartitionSpec.unpartitioned(), properties, tableLocation);
+    String orphan = new Path(tableLocation, "data/orphan.parquet").toString();
+    table.io().newOutputFile(orphan).create().close();
+    waitUntilAfter(System.currentTimeMillis());
+    SupportsPrefixOperations io =
+        Mockito.mock(
+            SupportsPrefixOperations.class,
+            Mockito.withSettings().serializable().defaultAnswer(delegatesTo(table.io())));
+    Mockito.when(io.supportsDirectoryListing(anyString())).thenReturn(false);
+    Table prefixOnlyTable = Mockito.spy(table);
+    Mockito.when(prefixOnlyTable.io()).thenReturn(io);
 
-    try (MockedStatic<FileSystemWalker> walker =
-        Mockito.mockStatic(FileSystemWalker.class, Mockito.CALLS_REAL_METHODS)) {
-      SparkActions.get().deleteOrphanFiles(table).usePrefixListing(true).execute();
+    DeleteOrphanFiles.Result result =
+        SparkActions.get()
+            .deleteOrphanFiles(prefixOnlyTable)
+            .usePrefixListing(true)
+            .olderThan(System.currentTimeMillis())
+            .execute();
 
-      walker.verify(
-          () ->
-              FileSystemWalker.listDirRecursivelyWithFileIO(
-                  any(SupportsPrefixOperations.class),
-                  eq(table.location()),
-                  anyMap(),
-                  any(Predicate.class),
-                  any()));
-      walker.verify(
-          () ->
-              FileSystemWalker.listDirRecursivelyWithFileIO(
-                  any(SupportsPrefixOperations.class),
-                  anyString(),
-                  anyMap(),
-                  any(Predicate.class),
-                  anyInt(),
-                  anyInt(),
-                  any(),
-                  any()),
-          Mockito.never());
-    }
+    assertThat(result.orphanFileLocations()).containsExactly(orphan);
+    assertThat(table.io().newInputFile(orphan).exists()).isFalse();
+    Mockito.verify(io).listPrefix(table.location() + "/");
+    Mockito.verify(io, Mockito.never()).listDirectory(anyString());
   }
 
   @TestTemplate
