@@ -20,6 +20,7 @@ package org.apache.iceberg.gcp.gcs;
 
 import com.google.api.client.util.Lists;
 import com.google.api.client.util.Maps;
+import com.google.api.gax.paging.Page;
 import com.google.cloud.storage.Blob;
 import com.google.cloud.storage.BlobId;
 import com.google.cloud.storage.Storage;
@@ -27,8 +28,10 @@ import java.time.Duration;
 import java.time.Instant;
 import java.time.temporal.ChronoUnit;
 import java.util.Comparator;
+import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
+import java.util.NoSuchElementException;
 import java.util.Objects;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.ScheduledFuture;
@@ -43,6 +46,7 @@ import org.apache.iceberg.io.DelegateFileIO;
 import org.apache.iceberg.io.FileInfo;
 import org.apache.iceberg.io.InputFile;
 import org.apache.iceberg.io.OutputFile;
+import org.apache.iceberg.io.PrefixListingPage;
 import org.apache.iceberg.io.StorageCredential;
 import org.apache.iceberg.io.SupportsStorageCredentials;
 import org.apache.iceberg.metrics.MetricsContext;
@@ -310,6 +314,82 @@ public class GCSFileIO implements DelegateFileIO, SupportsStorageCredentials {
                         blob.getSize(),
                         createTimeMillis(blob)))
             .iterator();
+  }
+
+  @SuppressWarnings("resource")
+  @Override
+  public Iterable<PrefixListingPage> listDirectory(String prefix) {
+    Preconditions.checkArgument(prefix != null, "Invalid directory prefix: null");
+    Preconditions.checkArgument(
+        !prefix.contains("?") && !prefix.contains("#"),
+        "Invalid directory prefix (must not contain a query or fragment): %s",
+        prefix);
+    Preconditions.checkArgument(
+        prefix.endsWith("/"), "Invalid directory prefix (must end with '/'): %s", prefix);
+    GCSLocation location = new GCSLocation(prefix);
+    return () ->
+        prefixListingPages(
+            clientForStoragePath(prefix)
+                .storage()
+                .list(
+                    location.bucket(),
+                    Storage.BlobListOption.prefix(location.prefix()),
+                    Storage.BlobListOption.currentDirectory()),
+            location.prefix());
+  }
+
+  @Override
+  public boolean supportsDirectoryListing(String prefix) {
+    return prefix != null && prefix.endsWith("/") && !prefix.contains("?") && !prefix.contains("#");
+  }
+
+  private Iterator<PrefixListingPage> prefixListingPages(Page<Blob> firstPage, String prefix) {
+    return new Iterator<PrefixListingPage>() {
+      private Page<Blob> currentPage = firstPage;
+      private boolean first = true;
+
+      @Override
+      public boolean hasNext() {
+        return first || currentPage.hasNextPage();
+      }
+
+      @Override
+      public PrefixListingPage next() {
+        if (!hasNext()) {
+          throw new NoSuchElementException();
+        }
+
+        if (first) {
+          first = false;
+        } else {
+          currentPage = currentPage.getNextPage();
+        }
+
+        List<FileInfo> files = Lists.newArrayList();
+        List<String> subPrefixes = Lists.newArrayList();
+        for (Blob blob : currentPage.getValues()) {
+          if (prefix.equals(blob.getName())) {
+            continue;
+          }
+
+          if (blob.isDirectory()) {
+            subPrefixes.add(createUri(blob));
+          } else {
+            files.add(createFileInfo(blob));
+          }
+        }
+
+        return PrefixListingPage.of(files, subPrefixes);
+      }
+    };
+  }
+
+  private FileInfo createFileInfo(Blob blob) {
+    return new FileInfo(createUri(blob), blob.getSize(), createTimeMillis(blob));
+  }
+
+  private String createUri(Blob blob) {
+    return "gs://" + blob.getBucket() + "/" + blob.getName();
   }
 
   private long createTimeMillis(Blob blob) {
