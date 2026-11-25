@@ -131,6 +131,7 @@ public class DeleteOrphanFilesSparkAction extends BaseSparkAction<DeleteOrphanFi
   private Consumer<String> deleteFunc = null;
   private ExecutorService deleteExecutorService = null;
   private boolean usePrefixListing = false;
+  private int prefixListingMaxSeedDepth = 0;
   private static final Encoder<FileURI> FILE_URI_ENCODER = Encoders.bean(FileURI.class);
 
   DeleteOrphanFilesSparkAction(SparkSession spark, Table table) {
@@ -222,6 +223,21 @@ public class DeleteOrphanFilesSparkAction extends BaseSparkAction<DeleteOrphanFi
     return this;
   }
 
+  /**
+   * Sets the directory depth used to discover prefixes for parallel listing.
+   *
+   * @param newMaxSeedDepth non-negative depth; zero keeps listing on the driver
+   * @return this for method chaining
+   */
+  public DeleteOrphanFilesSparkAction prefixListingMaxSeedDepth(int newMaxSeedDepth) {
+    Preconditions.checkArgument(
+        newMaxSeedDepth >= 0,
+        "Prefix listing max seed depth must be non-negative: %s",
+        newMaxSeedDepth);
+    this.prefixListingMaxSeedDepth = newMaxSeedDepth;
+    return this;
+  }
+
   private Dataset<String> filteredCompareToFileList() {
     Dataset<Row> files = compareToFileList;
     if (location != null) {
@@ -235,6 +251,9 @@ public class DeleteOrphanFilesSparkAction extends BaseSparkAction<DeleteOrphanFi
 
   @Override
   public DeleteOrphanFiles.Result execute() {
+    Preconditions.checkArgument(
+        prefixListingMaxSeedDepth == 0 || usePrefixListing,
+        "prefix_listing_max_seed_depth requires prefix_listing");
     JobGroupInfo info = newJobGroupInfo("DELETE-ORPHAN-FILES", jobDesc());
     return withJobGroupInfo(info, this::doExecute);
   }
@@ -417,6 +436,16 @@ public class DeleteOrphanFilesSparkAction extends BaseSparkAction<DeleteOrphanFi
     List<String> matchingFiles = Lists.newArrayList();
 
     if (usePrefixListing) {
+      if (prefixListingMaxSeedDepth > 0) {
+        String prefix = location.endsWith("/") ? location : location + "/";
+        Preconditions.checkArgument(
+            table.io() instanceof SupportsPrefixOperations
+                && ((SupportsPrefixOperations) table.io()).supportsDirectoryListing(prefix),
+            "Cannot use prefix_listing_max_seed_depth with FileIO %s: directory listing is not supported for %s",
+            table.io().getClass().getName(),
+            prefix);
+      }
+
       Preconditions.checkArgument(
           table.io() instanceof SupportsPrefixOperations,
           "Cannot use prefix listing with FileIO %s which does not support prefix operations.",
@@ -424,15 +453,36 @@ public class DeleteOrphanFilesSparkAction extends BaseSparkAction<DeleteOrphanFi
 
       Predicate<org.apache.iceberg.io.FileInfo> predicate =
           fileInfo -> fileInfo.createdAtMillis() < olderThanTimestamp;
-      FileSystemWalker.listDirRecursivelyWithFileIO(
-          (SupportsPrefixOperations) table.io(),
-          location,
-          table.specs(),
-          predicate,
-          matchingFiles::add);
+      if (prefixListingMaxSeedDepth == 0) {
+        FileSystemWalker.listDirRecursivelyWithFileIO(
+            (SupportsPrefixOperations) table.io(),
+            location,
+            table.specs(),
+            predicate,
+            matchingFiles::add);
+      } else {
+        FileSystemWalker.listDirRecursivelyWithFileIO(
+            (SupportsPrefixOperations) table.io(),
+            location,
+            table.specs(),
+            predicate,
+            prefixListingMaxSeedDepth,
+            MAX_DRIVER_LISTING_DIRECT_SUB_DIRS,
+            subDirs::add,
+            matchingFiles::add);
+      }
 
       JavaRDD<String> matchingFileRDD = sparkContext().parallelize(matchingFiles, 1);
-      return spark().createDataset(matchingFileRDD.rdd(), Encoders.STRING());
+      if (subDirs.isEmpty()) {
+        return spark().createDataset(matchingFileRDD.rdd(), Encoders.STRING());
+      }
+
+      int parallelism = Math.min(subDirs.size(), listingParallelism);
+      JavaRDD<String> prefixRDD = sparkContext().parallelize(subDirs, parallelism);
+      JavaRDD<String> matchingLeafFileRDD =
+          prefixRDD.mapPartitions(new ListPrefixes(broadcastTable(table), olderThanTimestamp));
+      return spark()
+          .createDataset(matchingFileRDD.union(matchingLeafFileRDD).rdd(), Encoders.STRING());
     } else {
       Predicate<FileStatus> predicate = file -> file.getModificationTime() < olderThanTimestamp;
       // list at most MAX_DRIVER_LISTING_DEPTH levels and only dirs that have
@@ -520,6 +570,31 @@ public class DeleteOrphanFilesSparkAction extends BaseSparkAction<DeleteOrphanFi
       }
 
       return files.iterator();
+    }
+  }
+
+  private static class ListPrefixes implements FlatMapFunction<Iterator<String>, String> {
+    private final long olderThanTimestamp;
+    private final Broadcast<Table> table;
+
+    ListPrefixes(Broadcast<Table> table, long olderThanTimestamp) {
+      this.olderThanTimestamp = olderThanTimestamp;
+      this.table = table;
+    }
+
+    @Override
+    public Iterator<String> call(Iterator<String> prefixes) {
+      Table localTable = table.value();
+      SupportsPrefixOperations io = (SupportsPrefixOperations) localTable.io();
+      return Iterators.concat(
+          Iterators.transform(
+              prefixes,
+              prefix ->
+                  FileSystemWalker.listDirRecursivelyWithFileIO(
+                      io,
+                      prefix,
+                      localTable.specs(),
+                      file -> file.createdAtMillis() < olderThanTimestamp)));
     }
   }
 

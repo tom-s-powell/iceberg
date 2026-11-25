@@ -319,6 +319,7 @@ Used to remove files which are not referenced in any metadata files of an Iceber
 | `equal_authorities` |    | map<string, string> | Mapping of file system authorities to be considered equal. Key is a comma-separated list of authorities and value is an authority. |
 | `prefix_mismatch_mode` |    | string | Action behavior when location prefixes (schemes/authorities) mismatch: <ul><li>ERROR - throw an exception. (default) </li><li>IGNORE - no action.</li><li>DELETE - delete files.</li></ul> |  
 | `prefix_listing` |    | boolean   | When true, use prefix-based file listing via the `SupportsPrefixOperations` interface. The Table FileIO implementation must support `SupportsPrefixOperations` when this flag is enabled (defaults to false) |
+| `prefix_listing_max_seed_depth` |    | int | In Spark 4.2, the directory depth used on the driver to find prefixes for parallel listing. Defaults to 0, which keeps prefix listing on the driver. Must be non-negative. A positive value requires `prefix_listing => true` and a FileIO that supports directory listing. |
 
 #### Output
 

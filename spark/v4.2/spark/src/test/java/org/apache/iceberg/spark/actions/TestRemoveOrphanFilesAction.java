@@ -28,6 +28,7 @@ import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyInt;
 import static org.mockito.ArgumentMatchers.anyMap;
 import static org.mockito.ArgumentMatchers.anyString;
+import static org.mockito.ArgumentMatchers.eq;
 
 import java.io.File;
 import java.io.IOException;
@@ -72,6 +73,7 @@ import org.apache.iceberg.exceptions.ValidationException;
 import org.apache.iceberg.hadoop.HadoopCatalog;
 import org.apache.iceberg.hadoop.HadoopTables;
 import org.apache.iceberg.hadoop.HiddenPathFilter;
+import org.apache.iceberg.io.SupportsPrefixOperations;
 import org.apache.iceberg.puffin.Blob;
 import org.apache.iceberg.puffin.Puffin;
 import org.apache.iceberg.puffin.PuffinWriter;
@@ -1192,6 +1194,119 @@ public abstract class TestRemoveOrphanFilesAction extends TestBase {
         ImmutableMap.of(),
         ImmutableMap.of(),
         DeleteOrphanFiles.PrefixMismatchMode.DELETE);
+  }
+
+  @TestTemplate
+  void prefixListingMaxSeedDepthDiscoversOrphans() throws IOException {
+    assumeThat(usePrefixListing).isTrue();
+    Table table = TABLES.create(SCHEMA, PartitionSpec.unpartitioned(), properties, tableLocation);
+    String firstOrphan = new Path(tableLocation, "data/a/orphan.parquet").toString();
+    String secondOrphan = new Path(tableLocation, "data/b/nested/orphan.parquet").toString();
+    String hiddenFile = new Path(tableLocation, "data/a/_temporary/hidden.parquet").toString();
+    table.io().newOutputFile(firstOrphan).create().close();
+    table.io().newOutputFile(secondOrphan).create().close();
+    table.io().newOutputFile(hiddenFile).create().close();
+    waitUntilAfter(System.currentTimeMillis());
+
+    try (MockedStatic<FileSystemWalker> walker =
+        Mockito.mockStatic(FileSystemWalker.class, Mockito.CALLS_REAL_METHODS)) {
+      DeleteOrphanFiles.Result result =
+          SparkActions.get()
+              .deleteOrphanFiles(table)
+              .usePrefixListing(true)
+              .prefixListingMaxSeedDepth(2)
+              .olderThan(System.currentTimeMillis())
+              .execute();
+
+      assertThat(result.orphanFileLocations()).containsExactlyInAnyOrder(firstOrphan, secondOrphan);
+      assertThat(result.orphanFilesCount()).isEqualTo(2L);
+      assertThat(table.io().newInputFile(hiddenFile).exists()).isTrue();
+      walker.verify(
+          () ->
+              FileSystemWalker.listDirRecursivelyWithFileIO(
+                  any(SupportsPrefixOperations.class),
+                  eq(table.location()),
+                  anyMap(),
+                  any(Predicate.class),
+                  eq(2),
+                  anyInt(),
+                  any(),
+                  any()));
+    }
+  }
+
+  @TestTemplate
+  void prefixListingDefaultsToDriverListing() {
+    assumeThat(usePrefixListing).isTrue();
+    Table table = TABLES.create(SCHEMA, PartitionSpec.unpartitioned(), properties, tableLocation);
+
+    try (MockedStatic<FileSystemWalker> walker =
+        Mockito.mockStatic(FileSystemWalker.class, Mockito.CALLS_REAL_METHODS)) {
+      SparkActions.get().deleteOrphanFiles(table).usePrefixListing(true).execute();
+
+      walker.verify(
+          () ->
+              FileSystemWalker.listDirRecursivelyWithFileIO(
+                  any(SupportsPrefixOperations.class),
+                  eq(table.location()),
+                  anyMap(),
+                  any(Predicate.class),
+                  any()));
+      walker.verify(
+          () ->
+              FileSystemWalker.listDirRecursivelyWithFileIO(
+                  any(SupportsPrefixOperations.class),
+                  anyString(),
+                  anyMap(),
+                  any(Predicate.class),
+                  anyInt(),
+                  anyInt(),
+                  any(),
+                  any()),
+          Mockito.never());
+    }
+  }
+
+  @TestTemplate
+  void prefixListingMaxSeedDepthRejectsNegative() {
+    Table table = TABLES.create(SCHEMA, PartitionSpec.unpartitioned(), properties, tableLocation);
+
+    assertThatThrownBy(
+            () -> SparkActions.get().deleteOrphanFiles(table).prefixListingMaxSeedDepth(-1))
+        .isInstanceOf(IllegalArgumentException.class)
+        .hasMessageContaining("Prefix listing max seed depth must be non-negative");
+  }
+
+  @TestTemplate
+  void prefixListingMaxSeedDepthRequiresPrefixListing() {
+    Table table = TABLES.create(SCHEMA, PartitionSpec.unpartitioned(), properties, tableLocation);
+
+    assertThatThrownBy(
+            () ->
+                SparkActions.get().deleteOrphanFiles(table).prefixListingMaxSeedDepth(1).execute())
+        .isInstanceOf(IllegalArgumentException.class)
+        .hasMessageContaining("prefix_listing_max_seed_depth requires prefix_listing");
+  }
+
+  @TestTemplate
+  void prefixListingMaxSeedDepthRequiresDirectoryListing() {
+    Table table = TABLES.create(SCHEMA, PartitionSpec.unpartitioned(), properties, tableLocation);
+    Table unsupportedTable = Mockito.spy(table);
+    SupportsPrefixOperations io = Mockito.mock(SupportsPrefixOperations.class);
+    Mockito.when(unsupportedTable.io()).thenReturn(io);
+
+    assertThatThrownBy(
+            () ->
+                SparkActions.get()
+                    .deleteOrphanFiles(unsupportedTable)
+                    .usePrefixListing(true)
+                    .prefixListingMaxSeedDepth(1)
+                    .execute())
+        .isInstanceOf(IllegalArgumentException.class)
+        .hasMessageContaining("prefix_listing_max_seed_depth")
+        .hasMessageContaining(io.getClass().getName());
+    Mockito.verify(io, Mockito.never()).listDirectory(anyString());
+    Mockito.verify(io, Mockito.never()).listPrefix(anyString());
   }
 
   @TestTemplate
