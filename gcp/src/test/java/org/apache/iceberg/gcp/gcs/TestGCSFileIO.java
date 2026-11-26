@@ -194,6 +194,26 @@ public class TestGCSFileIO {
   }
 
   @Test
+  void listDirectoryAcceptsReturnedSubPrefix() {
+    storage.create(BlobInfo.newBuilder(TEST_BUCKET, "directory/child/data.dat").build());
+
+    PrefixListingPage listing = io.listDirectory(gsUri("directory/")).iterator().next();
+    assertThat(listing.subPrefixes()).containsExactly(gsUri("directory/child/"));
+    String subPrefix = listing.subPrefixes().iterator().next();
+
+    assertThat(io.supportsDirectoryListing(subPrefix)).isTrue();
+    assertThat(io.listDirectory(subPrefix))
+        .singleElement()
+        .satisfies(
+            page -> {
+              assertThat(page.files())
+                  .extracting(FileInfo::location)
+                  .containsExactly(gsUri("directory/child/data.dat"));
+              assertThat(page.subPrefixes()).isEmpty();
+            });
+  }
+
+  @Test
   void listDirectoryOmitsDirectoryMarker() {
     storage.create(BlobInfo.newBuilder(TEST_BUCKET, "marker/").build());
     storage.create(BlobInfo.newBuilder(TEST_BUCKET, "marker/data.dat").build());
