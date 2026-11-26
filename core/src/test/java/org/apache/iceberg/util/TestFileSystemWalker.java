@@ -504,6 +504,28 @@ public class TestFileSystemWalker {
   }
 
   @Test
+  void rejectsUnsupportedDirectoryListingForChildPrefix() {
+    String root = "s3://bucket/table/";
+    PrefixListingPage page =
+        PrefixListingPage.of(ImmutableList.of(), ImmutableList.of(root + "child/"));
+    RecordingPrefixFileIO io =
+        new RecordingPrefixFileIO(ImmutableList.of(page)) {
+          @Override
+          public boolean supportsDirectoryListing(String prefix) {
+            return root.equals(prefix);
+          }
+        };
+
+    assertThatThrownBy(
+            () ->
+                FileSystemWalker.listDirRecursivelyWithFileIO(
+                    io, root, null, fileInfo -> true, 2, Integer.MAX_VALUE, dir -> {}, file -> {}))
+        .isInstanceOf(IllegalArgumentException.class)
+        .hasMessageContaining("FileIO does not support directory listing");
+    assertThat(io.calls).containsExactly(root);
+  }
+
+  @Test
   public void testListDirRecursivelyWithFileIOBucketRootBaseDir() {
     assertThat(
             listWithMockFileIO(
